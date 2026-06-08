@@ -194,29 +194,6 @@ You can also copy `.env.example` to `.env`, fill in the values, and start with `
 
 ---
 
-## 📄 License
-
-Copyright (c) 2026 Lavish-lal-13
-
-This project is made available for **educational and non-commercial use only**.
-
-You may:
-- View and study this code
-- Fork it for personal or academic learning
-- Reference it with attribution
-
-You may not:
-- Use this project or any portion for commercial purposes
-- Modify and redistribute it
-- Deploy it publicly without explicit written permission from the author
-
-For commercial licensing or collaboration inquiries, please contact: lavishlal99@gmail.com
-
-This work is licensed under the Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International License.
-See https://creativecommons.org/licenses/by-nc-nd/4.0/
-
----
-
 ## 👤 Author
 
 **Developed by Lavish Lal**  

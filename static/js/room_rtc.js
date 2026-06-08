@@ -26,6 +26,7 @@ let chunks = [];
 
 let localScreenTracks = null;
 let sharingScreen = false;
+let screenShareBusy = false;
 let rtcJoined = false;
 let streamJoined = false;
 let audioMuted = false;
@@ -74,6 +75,23 @@ let getTrackList = (tracks) => {
     return Array.isArray(tracks) ? tracks.filter(Boolean) : [tracks];
 }
 
+let getMediaTrack = (trackWrapper) => {
+    if (!trackWrapper) return null;
+
+    if (typeof trackWrapper.getMediaStreamTrack === 'function') {
+        return trackWrapper.getMediaStreamTrack();
+    }
+
+    return trackWrapper.kind ? trackWrapper : null;
+}
+
+let getFirstVideoTrack = (tracks) => {
+    return getTrackList(tracks).find((track) => {
+        let mediaTrack = getMediaTrack(track);
+        return mediaTrack && mediaTrack.kind === 'video';
+    });
+}
+
 let setTrackEnabled = async (track, enabled) => {
     if (!track) return;
 
@@ -99,6 +117,18 @@ let getMediaSetupErrorMessage = () => {
     return null;
 }
 
+let getScreenShareSetupErrorMessage = () => {
+    if (!window.isSecureContext) {
+        return 'Screen sharing requires HTTPS, localhost, or 127.0.0.1. Open the room from a secure origin and try again.';
+    }
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+        return 'This browser cannot share the screen from this page. Try a current Chrome, Edge, Firefox, or Safari browser.';
+    }
+
+    return null;
+}
+
 let getCameraErrorMessage = (err) => {
     let detail = `${err && err.name ? err.name : ''} ${err && err.message ? err.message : ''}`.toLowerCase();
 
@@ -119,6 +149,24 @@ let getCameraErrorMessage = (err) => {
     }
 
     return 'Could not open your camera or microphone. Check browser permissions and try again.';
+}
+
+let getScreenShareErrorMessage = (err) => {
+    let detail = `${err && err.name ? err.name : ''} ${err && err.message ? err.message : ''}`.toLowerCase();
+
+    if (detail.includes('notallowed') || detail.includes('permission') || detail.includes('denied')) {
+        return 'Screen sharing was blocked. Allow screen sharing in the browser prompt and try again.';
+    }
+
+    if (detail.includes('notfound') || detail.includes('notreadable') || detail.includes('abort')) {
+        return 'Screen sharing was cancelled or no shareable screen was selected.';
+    }
+
+    if (detail.includes('not supported') || detail.includes('notsupported')) {
+        return 'This browser does not support screen sharing from this page.';
+    }
+
+    return 'Screen sharing could not start. Please allow screen sharing and try again.';
 }
 
 let getAgoraConnectionErrorMessage = (err) => {
@@ -275,6 +323,7 @@ let sendPeerSignal = async (to, signalType, payload = null) => {
 
 let createNativeTrackWrapper = (track, ownerUid, muted = false) => {
     return {
+        kind: track.kind,
         setEnabled: async (enabled) => {
             track.enabled = enabled;
         },
@@ -341,6 +390,46 @@ let ensureLocalTracksOnPeer = (peerConnection) => {
             peerConnection.addTrack(track, localPeerStream);
         }
     });
+}
+
+let replaceLocalPeerStreamVideoTrack = (nextVideoTrack) => {
+    if (!localPeerStream || !nextVideoTrack) return;
+
+    localPeerStream.getVideoTracks().forEach((track) => {
+        if (track.id !== nextVideoTrack.id) {
+            localPeerStream.removeTrack(track);
+        }
+    });
+
+    let alreadyInStream = localPeerStream.getTracks().some((track) => track.id === nextVideoTrack.id);
+    if (!alreadyInStream) {
+        localPeerStream.addTrack(nextVideoTrack);
+    }
+}
+
+let replacePeerVideoTrack = async (nextVideoTrack) => {
+    if (!nextVideoTrack) return;
+
+    let replacements = Object.values(peerConnections).map(async (peerConnection) => {
+        if (typeof peerConnection.getSenders !== 'function') {
+            return;
+        }
+
+        let sender = peerConnection.getSenders().find((currentSender) => {
+            return currentSender.track && currentSender.track.kind === 'video';
+        });
+
+        if (sender && typeof sender.replaceTrack === 'function') {
+            await sender.replaceTrack(nextVideoTrack);
+            return;
+        }
+
+        if (localPeerStream) {
+            peerConnection.addTrack(nextVideoTrack, localPeerStream);
+        }
+    });
+
+    await Promise.all(replacements);
 }
 
 let removePeerMedia = (peerUid) => {
@@ -617,6 +706,7 @@ let leavePeerStream = async () => {
     }
 
     Object.keys(peerConnections).forEach(closePeerConnection);
+    closeTracks(localScreenTracks);
     closeTracks(localTracks);
 
     if (localPeerStream) {
@@ -624,6 +714,7 @@ let leavePeerStream = async () => {
     }
 
     localTracks = [];
+    localScreenTracks = null;
     localPeerStream = null;
     remoteUsers = {};
     streamJoined = false;
@@ -760,6 +851,10 @@ let joinStream = async () => {
 
 let switchToCamera = async () => {
     if (usingPeerVideoFallback) {
+        removeVideoContainer(uid);
+        displayFrame.style.display = null;
+        userIdInDisplayFrame = null;
+
         createLocalVideoContainer(document.getElementById('streams__container'));
         if (localTracks[1]) {
             localTracks[1].play(`user-${uid}`);
@@ -873,10 +968,22 @@ let startScreenShare = async () => {
     let cameraWasUnpublished = false;
 
     try {
+        let setupError = getScreenShareSetupErrorMessage();
+        if (setupError) {
+            addSystemMessageToDom(setupError);
+            return;
+        }
+
         screenTracks = await AgoraRTC.createScreenVideoTrack({
             encoderConfig: '1080p_1'
         });
         localScreenTracks = screenTracks;
+        let screenTrackList = getTrackList(localScreenTracks);
+        let screenVideoTrack = getFirstVideoTrack(screenTrackList);
+
+        if (!screenVideoTrack) {
+            throw new Error('No screen video track was created.');
+        }
 
         await client.unpublish([localTracks[1]]);
         cameraWasUnpublished = true;
@@ -885,9 +992,9 @@ let startScreenShare = async () => {
         displayFrame.style.display = 'block';
         userIdInDisplayFrame = `user-container-${uid}`;
         createLocalVideoContainer(displayFrame);
+        setLocalVideoAvatar(false);
 
-        let screenTrackList = getTrackList(localScreenTracks);
-        screenTrackList[0].play(`user-${uid}`);
+        screenVideoTrack.play(`user-${uid}`);
         await client.publish(screenTrackList);
 
         sharingScreen = true;
@@ -895,8 +1002,8 @@ let startScreenShare = async () => {
         cameraButton.classList.remove('active');
         cameraButton.style.display = 'none';
 
-        if (screenTrackList[0] && typeof screenTrackList[0].on === 'function') {
-            screenTrackList[0].on('track-ended', () => {
+        if (screenVideoTrack && typeof screenVideoTrack.on === 'function') {
+            screenVideoTrack.on('track-ended', () => {
                 if (sharingScreen) {
                     stopScreenShare();
                 }
@@ -912,7 +1019,7 @@ let startScreenShare = async () => {
         if (cameraWasUnpublished) {
             await switchToCamera();
         }
-        addSystemMessageToDom('Screen sharing could not start. Please allow screen sharing and try again.');
+        addSystemMessageToDom(getScreenShareErrorMessage(err));
     }
 }
 
@@ -937,21 +1044,133 @@ let stopScreenShare = async () => {
     await switchToCamera();
 }
 
+let startPeerScreenShare = async () => {
+    let screenStream = null;
+    let screenTrack = null;
+
+    try {
+        let setupError = getScreenShareSetupErrorMessage();
+        if (setupError) {
+            addSystemMessageToDom(setupError);
+            return;
+        }
+
+        screenStream = await navigator.mediaDevices.getDisplayMedia({
+            video: {
+                width: { ideal: 1920 },
+                height: { ideal: 1080 },
+                frameRate: { ideal: 30 }
+            },
+            audio: false
+        });
+
+        screenTrack = screenStream.getVideoTracks()[0];
+        if (!screenTrack) {
+            throw new Error('No screen video track was created.');
+        }
+
+        localScreenTracks = [createNativeTrackWrapper(screenTrack, uid, true)];
+        replaceLocalPeerStreamVideoTrack(screenTrack);
+        await replacePeerVideoTrack(screenTrack);
+
+        removeVideoContainer(uid);
+        displayFrame.style.display = 'block';
+        userIdInDisplayFrame = `user-container-${uid}`;
+        createLocalVideoContainer(displayFrame);
+        setLocalVideoAvatar(false);
+        localScreenTracks[0].play(`user-${uid}`);
+
+        sharingScreen = true;
+        screenButton.classList.add('active');
+        cameraButton.classList.remove('active');
+        cameraButton.style.display = 'none';
+
+        screenTrack.onended = () => {
+            if (sharingScreen) {
+                stopPeerScreenShare();
+            }
+        };
+    } catch (err) {
+        console.error('Peer screen share error:', err);
+
+        if (screenStream) {
+            screenStream.getTracks().forEach((track) => track.stop());
+        } else if (screenTrack) {
+            screenTrack.stop();
+        }
+
+        localScreenTracks = null;
+        sharingScreen = false;
+        screenButton.classList.remove('active');
+        cameraButton.style.display = '';
+        cameraButton.classList.toggle('active', !cameraMuted);
+
+        let cameraTrack = getMediaTrack(localTracks[1]);
+        if (cameraTrack && cameraTrack.readyState === 'live') {
+            replaceLocalPeerStreamVideoTrack(cameraTrack);
+            await setTrackEnabled(localTracks[1], !cameraMuted);
+            await replacePeerVideoTrack(cameraTrack).catch((restoreErr) => {
+                console.warn('Could not restore camera after failed screen share:', restoreErr);
+            });
+            await switchToCamera();
+        }
+
+        addSystemMessageToDom(getScreenShareErrorMessage(err));
+    }
+}
+
+let stopPeerScreenShare = async () => {
+    let screenTrackList = getTrackList(localScreenTracks);
+    let cameraTrack = getMediaTrack(localTracks[1]);
+
+    try {
+        if (cameraTrack && cameraTrack.readyState === 'live') {
+            replaceLocalPeerStreamVideoTrack(cameraTrack);
+            await setTrackEnabled(localTracks[1], !cameraMuted);
+            await replacePeerVideoTrack(cameraTrack);
+        }
+    } catch (err) {
+        console.warn('Could not restore camera track after screen share:', err);
+    }
+
+    closeTracks(screenTrackList);
+    localScreenTracks = null;
+    sharingScreen = false;
+    screenButton.classList.remove('active');
+    cameraButton.style.display = '';
+    cameraButton.classList.toggle('active', !cameraMuted);
+
+    await switchToCamera();
+}
+
 let toggleScreen = async () => {
-    if (usingPeerVideoFallback) {
-        addSystemMessageToDom('Screen sharing is unavailable while using the built-in video fallback.');
+    if (screenShareBusy) {
         return;
     }
 
-    if (!streamJoined || !client || !localTracks[1]) {
+    if (!streamJoined || !localTracks[1] || (!usingPeerVideoFallback && !client)) {
         addSystemMessageToDom('Join the stream before sharing your screen.');
         return;
     }
 
-    if (sharingScreen) {
-        await stopScreenShare();
-    } else {
-        await startScreenShare();
+    screenShareBusy = true;
+    screenButton.disabled = true;
+
+    try {
+        if (sharingScreen) {
+            if (usingPeerVideoFallback) {
+                await stopPeerScreenShare();
+            } else {
+                await stopScreenShare();
+            }
+        } else if (usingPeerVideoFallback) {
+            await startPeerScreenShare();
+        } else {
+            await startScreenShare();
+        }
+    } finally {
+        screenShareBusy = false;
+        screenButton.disabled = false;
     }
 }
 
@@ -978,16 +1197,6 @@ let getSupportedRecordingMimeType = () => {
     ];
 
     return mimeTypes.find((mimeType) => MediaRecorder.isTypeSupported(mimeType)) || '';
-}
-
-let getMediaTrack = (trackWrapper) => {
-    if (!trackWrapper) return null;
-
-    if (typeof trackWrapper.getMediaStreamTrack === 'function') {
-        return trackWrapper.getMediaStreamTrack();
-    }
-
-    return trackWrapper.kind ? trackWrapper : null;
 }
 
 let getRecordingAudioTracks = () => {

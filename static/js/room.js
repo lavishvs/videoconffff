@@ -22,13 +22,8 @@ memberButton.addEventListener('click', () => {
 let activeChatContainer = false;
 
 chatButton.addEventListener('click', () => {
-  if (activeChatContainer) {
-    chatContainer.style.display = 'none';
-  } else {
-    chatContainer.style.display = 'block';
-  }
-
   activeChatContainer = !activeChatContainer;
+  chatContainer.classList.toggle('active', activeChatContainer);
 });
 
 let displayFrame = document.getElementById('stream__box')
